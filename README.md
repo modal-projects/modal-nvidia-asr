@@ -22,7 +22,7 @@ Audio Stream → VAD Segmenter (CPU) → Parakeet Transcriber (GPU)
 
 The VAD segmenter:
 - Runs as a **separate Modal function** (CPU-only, no GPU)
-- Uses Silero VAD to detect speech start/stop in the audio stream
+- Uses Silero VAD (via Pipecat's wrapper) to detect speech start/stop in the audio stream (see [Pipecat's docs](https://docs.pipecat.ai/guides/learn/speech-input) for settings)
 - Buffers audio during speech and segments it when speech ends
 - Calls the Parakeet transcriber endpoint with **batch_size = 1** for each segment
 
@@ -34,6 +34,12 @@ Install dependencies:
 
 ```bash
 pip install modal
+```
+
+Authenticate your Modal account:
+
+```bash
+modal setup
 ```
 
 Deploy to Modal:
@@ -48,5 +54,8 @@ modal deploy -m parakeet.vad_segmenter
 
 ## Frontend
 
-The `streaming-parakeet-frontend/` directory contains a simple web interface for testing streaming transcription via WebSocket.
+The `streaming-parakeet-frontend/` directory contains a simple web interface for testing streaming transcription via WebSocket. When you deploy `vad_segmenter` you'll see the URL for the frontend printed in the console. It will have the following format:
+```bash
+https://{workspace}-{environment}--silero-vad-segmenter-webserver-web.modal.run
+```
 
