@@ -1,4 +1,4 @@
-# Parakeet Patterns
+# Batch and Streaming Parakeet
 
 This repository demonstrates how to deploy NVIDIA's Parakeet ASR model on Modal for both **batch** and **streaming** transcription.
 
