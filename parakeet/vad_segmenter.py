@@ -37,7 +37,7 @@ with image.imports():
 @app.cls(
     volumes={cache_path: model_cache}, 
     image=image,
-    min_containers=1,
+    # min_containers=1,
 )
 class SileroVADSegmenter:
 
@@ -73,7 +73,6 @@ class SileroVADSegmenter:
             async def recv_loop(ws, audio_queue):
                 while True:
                     data = await ws.receive_bytes()
-                    print(f"Received {len(data)} bytes")
                     if data == SHUTDOWN_SIGNAL:
                         await streaming_audio_queue.put(SHUTDOWN_SIGNAL)
                         break
@@ -114,7 +113,6 @@ class SileroVADSegmenter:
                     if audio_segment == SHUTDOWN_SIGNAL:
                         await transcription_queue.put(SHUTDOWN_SIGNAL)
                         break
-                    print(f"Received {len(audio_segment)} bytes for transcription")
                     transcript = await self.transcriber.transcribe.remote.aio(audio_segment)
                     print(f"Transcript: {transcript}")
                     await transcription_queue.put(transcript)

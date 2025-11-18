@@ -62,7 +62,7 @@ with image.imports():
     volumes={CACHE_DIR: model_cache}, 
     gpu="L40S", 
     image=image,
-    min_containers=1,
+    # min_containers=1,
 )
 class Parakeet:
 
@@ -110,7 +110,7 @@ class Parakeet:
             print(await self.transcribe.local(batch))
 
     @modal.method()
-    async def transcribe(self, audio_data: Union[bytes, bytearray, list[bytes]]) -> str:
+    async def transcribe(self, audio_data: Union[bytes, bytearray, list[Union[bytes, bytearray]]]) -> str:
 
         print(type(audio_data))
         if not isinstance(audio_data, list):
