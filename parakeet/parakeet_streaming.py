@@ -43,7 +43,6 @@ image = (
 )
 
 SAMPLE_RATE = 16000
-MIN_AUDIO_SEGMENT_DURATION_SAMPLES = int(SAMPLE_RATE / 2)
 PARAKEET_RT_STREAMING_CHUNK_SIZE = int(0.080 * SAMPLE_RATE) * 2 # 
 
 def chunk_audio(data: bytes, chunk_size: int):
@@ -56,8 +55,6 @@ with image.imports():
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from starlette.websockets import WebSocketState
     from urllib.request import urlopen
-    import threading
-    import uvicorn
     from fastapi import FastAPI
     from .parakeet_realtime_eou_service import NemoStreamingASRService
     from .asr_utils import preprocess_audio
