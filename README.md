@@ -1,10 +1,10 @@
 # Batch and Streaming Parakeet
 
-This repository demonstrates how to deploy NVIDIA's Parakeet ASR model on Modal for both **batch** and **streaming** transcription.
+This repository demonstrates three approaches to deploy NVIDIA's Parakeet ASR models on Modal for **batch** and **streaming** transcription.
 
 ## Implementation
 
-### Batch Transcription (`parakeet/parakeet.py`)
+### 1. Batch Transcription (`parakeet/parakeet.py`)
 
 The core Parakeet transcriber runs on GPU and handles both single audio files and batches:
 
@@ -12,9 +12,9 @@ The core Parakeet transcriber runs on GPU and handles both single audio files an
 - Processes batches up to `BATCH_SIZE = 128` for efficient GPU utilization
 - Exposes a Modal method that can be called from anywhere
 
-### Streaming Transcription (`parakeet/vad_segmenter.py`)
+### 2. Streaming with VAD Segmentation (`parakeet/vad_segmenter.py`)
 
-Parakeet doesn't natively support streaming—it needs complete audio segments. So we use **Voice Activity Detection (VAD)** to segment the stream:
+For Parakeet models that don't natively support streaming, we use **Voice Activity Detection (VAD)** to segment the stream:
 
 ```
 Audio Stream → VAD Segmenter (CPU) → Parakeet Transcriber (GPU)
@@ -27,6 +27,23 @@ The VAD segmenter:
 - Calls the Parakeet transcriber endpoint with **batch_size = 1** for each segment
 
 **Why separate the VAD from transcription?** This architecture enables independent autoscaling and better GPU utilization. Multiple VAD segmenters (cheap CPU) can feed a smaller pool of GPU transcribers, so GPUs only run when there's actual speech to transcribe.
+
+### 3. Native Streaming Transcription (`parakeet/parakeet_streaming.py`)
+
+The newest approach uses NVIDIA's **Parakeet Realtime model** (`nvidia/parakeet_realtime_eou_120m-v1`) with native streaming support:
+
+```
+Audio Stream → Parakeet Realtime (GPU) → Transcription
+```
+
+Key features:
+- **No VAD required** — the model processes audio chunks directly as they arrive
+- Uses `NemoStreamingASRService` with built-in end-of-utterance (EOU) detection
+- Processes audio in 80ms chunks for low-latency transcription
+- Single GPU-based service handles both audio ingestion and transcription
+- WebSocket-based streaming interface
+
+This approach offers the lowest latency and simplest architecture since everything runs in one place, but requires GPU for the entire audio stream (not just during speech).
 
 ## Getting Started
 
@@ -45,17 +62,27 @@ modal setup
 Deploy to Modal:
 
 ```bash
-# Batch transcription
+# 1. Batch transcription
 modal deploy -m parakeet.parakeet
 
-# Streaming transcription  
+# 2. Streaming with VAD segmentation
 modal deploy -m parakeet.vad_segmenter
+
+# 3. Native streaming transcription (Parakeet Realtime)
+modal deploy -m parakeet.parakeet_streaming
 ```
 
 ## Frontend
 
-The `streaming-parakeet-frontend/` directory contains a simple web interface for testing streaming transcription via WebSocket. When you deploy `vad_segmenter` you'll see the URL for the frontend printed in the console. It will have the following format:
-```bash
-https://{workspace}-{environment}--silero-vad-segmenter-webserver-web.modal.run
-```
+The `parakeet-frontend/` directory contains a simple web interface for testing streaming transcription via WebSocket. 
+
+When you deploy either streaming version:
+- **VAD segmentation** (`vad_segmenter`): Frontend URL will be printed to console with format:
+  ```bash
+  https://{workspace}-{environment}--silero-vad-segmenter-webserver-web.modal.run
+  ```
+- **Native streaming** (`parakeet_streaming`): Frontend URL will be printed to console with format:
+  ```bash
+  https://{workspace}-{environment}--parakeet-streaming-transcription-{shorten-id}.modal.run
+  ```
 
