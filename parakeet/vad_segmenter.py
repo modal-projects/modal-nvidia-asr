@@ -149,7 +149,7 @@ web_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("fastapi")
     .add_local_dir(
-        Path(__file__).parent.parent /"streaming-parakeet-frontend", "/root/frontend"
+        Path(__file__).parent.parent /"parakeet-frontend", "/root/frontend"
     )
 )
 
@@ -157,11 +157,6 @@ with web_image.imports():
     from fastapi import FastAPI,  WebSocket
     from fastapi.responses import HTMLResponse, Response
     from fastapi.staticfiles import StaticFiles
-
-
-
-
-
 
 @app.cls(image=web_image)
 @modal.concurrent(max_inputs=1000)
