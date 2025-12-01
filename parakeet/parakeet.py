@@ -54,7 +54,6 @@ with image.imports():
         batch_seq, 
         NoStdStreams,
         write_wav_file,
-        bytes_to_torch
     )
 
 

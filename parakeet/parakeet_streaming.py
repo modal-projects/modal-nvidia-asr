@@ -8,11 +8,7 @@ import modal
 
 
 app = modal.App("parakeet-streaming-transcription")
-
 model_cache = modal.Volume.from_name("parakeet-model-cache", create_if_missing=True)
-parakeet_dict = modal.Dict.from_name("parakeet-dict", create_if_missing=True)
-
-hf_secret = modal.Secret.from_name("huggingface-secret")
 
 image = (
     modal.Image.from_registry(
@@ -55,7 +51,6 @@ with image.imports():
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from starlette.websockets import WebSocketState
     from urllib.request import urlopen
-    from fastapi import FastAPI
     from .parakeet_realtime_eou_service import NemoStreamingASRService
     from .asr_utils import preprocess_audio
 
@@ -64,10 +59,8 @@ with image.imports():
     volumes={"/cache": model_cache}, 
     gpu=["A100"], 
     image=image,
-    # uncomment min containers for testing
-    min_containers=1,
     scaledown_window=10,
-    secrets=[hf_secret] if hf_secret is not None else [],
+    # secrets=[hf_secret] if hf_secret is not None else [],
 )
 @modal.concurrent(max_inputs=20)
 class Transcriber:
