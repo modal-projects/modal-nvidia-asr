@@ -158,9 +158,6 @@ with image.imports():
     gpu=["A100"], 
     image=image,
     secrets=[hf_secret] if hf_secret is not None else [],
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
-    min_containers=1,
 )
 class Transcriber:
 

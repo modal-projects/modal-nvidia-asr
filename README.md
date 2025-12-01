@@ -1,6 +1,6 @@
 # Batch and Streaming Parakeet
 
-This repository demonstrates three approaches to deploy NVIDIA's Parakeet ASR models on Modal for **batch** and **streaming** transcription.
+This repository demonstrates four approaches to deploy NVIDIA's Parakeet ASR models on Modal for **batch** and **streaming** transcription.
 
 ## Implementation
 
@@ -45,6 +45,24 @@ Key features:
 
 This approach offers the lowest latency and simplest architecture since everything runs in one place, but requires GPU for the entire audio stream (not just during speech).
 
+### 4. Multi-Speaker Native Streaming (`parakeet/parakeet_multitalker.py`)
+
+The most advanced approach combines real-time **speaker diarization** with **multi-talker ASR** for streaming transcription with speaker labels:
+
+```
+Audio Stream → Sortformer Diarization + Multi-talker Parakeet (GPU) → Speaker-tagged Transcription
+```
+
+Key features:
+- **Multi-speaker support** — automatically separates and transcribes up to 4 concurrent speakers
+- Uses NVIDIA's `multitalker-parakeet-streaming-0.6b-v1` model with `diar_streaming_sortformer_4spk-v2.1` diarization
+- **Cache-aware buffering** — intelligent audio buffering that aligns with model's cache requirements
+- Processes audio in 80ms frames with 13-frame buffer for optimal streaming performance
+- WebSocket-based streaming interface with speaker-tagged output
+- Single GPU-based service handles diarization and multi-speaker transcription simultaneously
+
+This approach is ideal for scenarios with multiple speakers (meetings, conversations, interviews) where you need to know "who said what" in real-time.
+
 ## Getting Started
 
 Install dependencies:
@@ -70,13 +88,16 @@ modal deploy -m parakeet.vad_segmenter
 
 # 3. Native streaming transcription (Parakeet Realtime)
 modal deploy -m parakeet.parakeet_streaming
+
+# 4. Multi-speaker native streaming transcription
+modal deploy -m parakeet.parakeet_multitalker
 ```
 
 ## Frontend
 
 The `parakeet-frontend/` directory contains a simple web interface for testing streaming transcription via WebSocket. 
 
-When you deploy either streaming version:
+When you deploy any streaming version:
 - **VAD segmentation** (`vad_segmenter`): Frontend URL will be printed to console with format:
   ```bash
   https://{workspace}-{environment}--silero-vad-segmenter-webserver-web.modal.run
@@ -84,5 +105,9 @@ When you deploy either streaming version:
 - **Native streaming** (`parakeet_streaming`): Frontend URL will be printed to console with format:
   ```bash
   https://{workspace}-{environment}--parakeet-streaming-transcription-{shorten-id}.modal.run
+  ```
+- **Multi-speaker streaming** (`parakeet_multitalker`): Frontend URL will be printed to console with format:
+  ```bash
+  https://{workspace}-{environment}--parakeet-multitalker-webserver-web.modal.run
   ```
 
