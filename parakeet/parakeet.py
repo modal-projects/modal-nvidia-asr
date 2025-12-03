@@ -26,7 +26,7 @@ image = (
         }
     )
     .apt_install("ffmpeg")
-    .pip_install(
+    .uv_pip_install(
         "hf_transfer==0.1.9",
         "huggingface_hub[hf-xet]==0.31.2",
         "nemo_toolkit[asr]==2.3.0",
@@ -34,6 +34,7 @@ image = (
         "numpy<2",
         "torchaudio",
         "soundfile",
+        "fastapi[standard]",
     )
     .entrypoint([])  # silence chatty logs by container on start
 )
@@ -49,11 +50,13 @@ NUM_WARMUP_BATCHES = 4
 with image.imports():
     import nemo.collections.asr as nemo_asr
     import torch
+    from fastapi import FastAPI, Request
     from .asr_utils import (
         preprocess_audio, 
         batch_seq, 
         NoStdStreams,
         write_wav_file,
+        bytes_to_torch,
     )
 
 
@@ -61,6 +64,7 @@ with image.imports():
     volumes={CACHE_DIR: model_cache}, 
     gpu="L40S", 
     image=image,
+    min_containers=1,
 )
 class Parakeet:
 
@@ -110,47 +114,91 @@ class Parakeet:
     @modal.method()
     async def transcribe(self, audio_data: Union[bytes, bytearray, list[Union[bytes, bytearray]]]) -> str:
 
-        print(type(audio_data))
-        if not isinstance(audio_data, list):
-            audio_data = [audio_data]
+        if isinstance(audio_data, list):
 
-        print(f"Received {len(audio_data)} audio segments for transcription.")
+            print(f"Received {len(audio_data)} audio segments for transcription.")
 
-        # we need to write the audio data to temporary files for batch transcription
-        # temp_files = []
-        # You can set the number of threads by passing max_workers to ThreadPoolExecutor
-        num_threads = len(audio_data)  # Set this to your desired number of threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-            audio_data = list(executor.map(write_wav_file, enumerate(audio_data)))
+            # we need to write the audio data to temporary files for batch transcription
+            # temp_files = []
+            # You can set the number of threads by passing max_workers to ThreadPoolExecutor
+            num_threads = len(audio_data)  # Set this to your desired number of threads
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+                audio_data = list(executor.map(write_wav_file, enumerate(audio_data)))
+            batch_size = len(audio_data)
 
+            with NoStdStreams():
+                with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
+                    output = self.model.transcribe(audio_data, batch_size=batch_size, num_workers=1)
+        else:
+            audio_data = bytes_to_torch(audio_data)
+            with NoStdStreams():
+                with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
+                    output = self.model.transcribe(audio_data)
 
-        with NoStdStreams():
-            with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
-                output = self.model.transcribe(audio_data, batch_size=len(audio_data), num_workers=1)
+        if isinstance(audio_data, list):
+            return [result.text for result in output]
+
+        return output[0].text
         
-        if len(audio_data) == 1:
-            return output[0].text
-        return [result.text for result in output]
 
+    @modal.asgi_app()
+    def webapp(self):
 
+        web_app = FastAPI()
 
-@app.local_entrypoint()
-async def main():
+        @web_app.post("/api")
+        async def api(request: Request):
+            audio_data = await request.body()
+            return {"transcript": await self.transcribe.local(audio_data)}
 
+        return web_app
+
+@app.function(image=image)
+async def transcribe_with_api():
     from .asr_utils import preprocess_audio, batch_seq
+    import aiohttp
+    import time
 
-    parakeet = Parakeet()
+    url = Parakeet().webapp.get_web_url() + "/api"
 
     # warm up gpu
     AUDIO_URL = "https://github.com/voxserv/audio_quality_testing_samples/raw/refs/heads/master/mono_44100/156550__acclivity__a-dream-within-a-dream.wav"
     audio_bytes = preprocess_audio(AUDIO_URL, target_sample_rate=16000)
     # Then chunk the audio data (not the raw bytes)
-    chunk_size_seconds = 5
+    chunk_size_seconds = 10
     chunk_size = SAMPLE_RATE * chunk_size_seconds * SAMPLE_WIDTH_BYTES  # at 16kHz
     audio_chunks = batch_seq(audio_bytes, chunk_size)
 
-    transcripts = await parakeet.transcribe.remote.aio(audio_chunks)
-    print(f"Batch transcripts: {[transcript for transcript in transcripts]}")
+    latencies = []
+    async with aiohttp.ClientSession() as session:
+        for i, chunk in enumerate(audio_chunks):
+            start_time = time.perf_counter()
+            try:
+                async with session.post(
+                    url,
+                    data=chunk,
+                    headers={"Content-Type": "application/octet-stream"}
+                ) as response:
+                    if response.status != 200:
+                        print(f"Bad response: {response.status}")
+                        resp_text = await response.text()
+                        print(resp_text)
+                        continue
+                    resp_json = await response.json()
+                    transcript = resp_json.get("transcript", "")
+                    end_time = time.perf_counter()
+                    print(transcript)
+                    if i != 0:
+                        latencies.append(end_time - start_time)
+            except aiohttp.ClientError as e:
+                print(f"HTTP Error: {e}")
+                continue
 
-    transcript = await parakeet.transcribe.remote.aio(audio_chunks[0])
-    print(f"Single transcript: {transcript[0]}")
+    if latencies:
+        print(f"Average latency: {sum(latencies) / len(latencies)} seconds")
+
+
+@app.local_entrypoint()
+async def main():
+
+    await transcribe_with_api.remote.aio()
