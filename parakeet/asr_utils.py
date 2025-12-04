@@ -93,8 +93,7 @@ def preprocess_audio(audio: bytes | str, target_sample_rate: int = 16000, return
     # Return tensor if requested
     if return_tensor:
         # Force shape to be exactly (1, num_samples)
-        tensor = torch.from_numpy(waveform).reshape(1, -1)
-        print(tensor.shape)
+        tensor = torch.from_numpy(waveform).to("cuda")
         return tensor
     
     # Convert to 16-bit PCM bytes

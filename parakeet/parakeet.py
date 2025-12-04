@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Optional, Literal
 import concurrent.futures
 import logging
 
@@ -114,9 +114,15 @@ class Parakeet:
             print(await self.transcribe.local(batch))
 
     @modal.method()
-    async def transcribe(self, audio_data: Union[bytes, bytearray, list[Union[bytes, bytearray]]]) -> str:
+    async def transcribe(
+        self, 
+        audio_data: Union[bytes, bytearray, list[Union[bytes, bytearray]]],
+        timestamp_level: Optional[Literal['word', 'segment', 'char']] = None
+    ) -> Union[dict, list[dict]]:
 
-        if isinstance(audio_data, list):
+        is_batch = isinstance(audio_data, list)
+        
+        if is_batch:
 
             print(f"Received {len(audio_data)} audio segments for transcription.")
 
@@ -130,18 +136,57 @@ class Parakeet:
 
             with NoStdStreams():
                 with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
-                    output = self.model.transcribe(audio_data, batch_size=batch_size, num_workers=1)
+                    output = self.model.transcribe(
+                        audio_data, 
+                        batch_size=batch_size, 
+                        num_workers=1,
+                        timestamps=timestamp_level is not None
+                    )
         else:
-            audio_data = preprocess_audio(audio_data)
-            audio_data = bytes_to_torch(audio_data)
+            audio_data = preprocess_audio(audio_data, return_tensor=True)
             with NoStdStreams():
                 with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
-                    output = self.model.transcribe(audio_data)
+                    output = self.model.transcribe(
+                        audio_data,
+                        timestamps=timestamp_level is not None,
+                        return_hypotheses=True,
+                    )
 
-        if isinstance(audio_data, list):
-            return [result.text for result in output]
-
-        return output[0].text
+        # Format output - always return dict with transcript and timestamps
+        if is_batch:
+            results = []
+            for result in output:
+                if timestamp_level is not None:
+                    timestamps_data = result.timestamp.get(timestamp_level, [])
+                    formatted_timestamps = [
+                        (stamp.get(timestamp_level, stamp.get('segment', '')), stamp['start'], stamp['end'])
+                        for stamp in timestamps_data
+                    ]
+                else:
+                    formatted_timestamps = []
+                
+                results.append({
+                    "transcript": result.text,
+                    "timestamps": formatted_timestamps
+                })
+            return results
+        else:
+            result = output[0]
+            # print all fields of the result
+            print(result.__dict__.keys())
+            if timestamp_level is not None:
+                timestamps_data = result.timestamp.get(timestamp_level, [])
+                formatted_timestamps = [
+                    (stamp.get(timestamp_level, stamp.get('segment', '')), stamp['start'], stamp['end'])
+                    for stamp in timestamps_data
+                ]
+            else:
+                formatted_timestamps = []
+            
+            return {
+                "transcript": result.text,
+                "timestamps": formatted_timestamps
+            }
         
 
     @modal.asgi_app()
@@ -150,9 +195,15 @@ class Parakeet:
         web_app = FastAPI()
 
         @web_app.post("/api")
-        async def api(request: Request):
+        async def api(
+            request: Request, 
+            timestamp_level: Optional[Literal['word', 'segment', 'char']] = None
+        ):
             audio_data = await request.body()
-            return {"transcript": await self.transcribe.local(audio_data)}
+            result = await self.transcribe.local(audio_data, timestamp_level=timestamp_level)
+            
+            # Result is always in the correct format now
+            return result
 
         return web_app
 
@@ -163,7 +214,7 @@ async def transcribe_with_api():
     import time
     import json
 
-    url = Parakeet().webapp.get_web_url() + "/api"
+    url = Parakeet().webapp.get_web_url() + "/api?timestamp_level=word"
 
     # warm up gpu
     AUDIO_URL = "https://github.com/voxserv/audio_quality_testing_samples/raw/refs/heads/master/mono_44100/156550__acclivity__a-dream-within-a-dream.wav"
@@ -195,8 +246,16 @@ async def transcribe_with_api():
             
             resp_json = json.loads(result.stdout)
             transcript = resp_json.get("transcript", "")
+            timestamps = resp_json.get("timestamps", [])
             end_time = time.perf_counter()
-            print(transcript)
+            
+            print(f"\n--- Chunk {i} ---")
+            print(f"Transcript: {transcript}")
+            if timestamps:
+                print("Word-level timestamps:")
+                for word, start, end in timestamps:
+                    print(f"  {start:.2f}s - {end:.2f}s : '{word}'")
+            
             if i != 0:
                 latencies.append(end_time - start_time)
         except subprocess.CalledProcessError as e:
@@ -209,10 +268,14 @@ async def transcribe_with_api():
             continue
 
     if latencies:
-        print(f"Average latency: {sum(latencies) / len(latencies)} seconds")
+        print(f"\nAverage latency: {sum(latencies) / len(latencies):.3f} seconds")
 
 
 @app.local_entrypoint()
 async def main():
 
     await transcribe_with_api.remote.aio()
+
+if __name__ == "__main__":
+    transcribe_with_api_func = modal.Function.from_name(app.name, "transcribe_with_api")
+    transcribe_with_api_func.remote()
