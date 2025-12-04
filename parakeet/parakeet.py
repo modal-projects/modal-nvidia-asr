@@ -34,6 +34,7 @@ image = (
         "numpy<2",
         "torchaudio",
         "soundfile",
+        "resampy",
         "fastapi[standard]",
     )
     .apt_install("curl")

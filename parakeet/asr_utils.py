@@ -13,65 +13,95 @@ from omegaconf import DictConfig
 
 import nemo.collections.asr as nemo_asr
 
-def preprocess_audio(audio: bytes | str, target_sample_rate: int = 16000) -> bytes:
-    import array
+def preprocess_audio(audio: bytes | str, target_sample_rate: int = 16000, return_tensor: bool = False):
+    """
+    Preprocess audio to mono, 16-bit PCM at target sample rate.
+    Handles multiple formats: WAV, MP3, FLAC, OGG, etc.
+    
+    Args:
+        audio: Either a URL/file path (str) or audio bytes
+        target_sample_rate: Target sample rate (default: 16000 Hz)
+        return_tensor: If True, return torch.Tensor instead of bytes (default: False)
+    
+    Returns:
+        Raw PCM bytes (16-bit, mono, at target_sample_rate) or torch.Tensor if return_tensor=True
+    """
     import io
-    import wave
-
+    import tempfile
+    import subprocess
+    import soundfile as sf
+    import numpy as np
+    import torch
+    import os
+    
+    # If string, load from URL or file
     if isinstance(audio, str):
-        audio = get_bytes_from_wav(audio)
-
-    with wave.open(io.BytesIO(audio), "rb") as wav_in:
-        n_channels = wav_in.getnchannels()
-        sample_width = wav_in.getsampwidth()
-        frame_rate = wav_in.getframerate()
-        n_frames = wav_in.getnframes()
-        frames = wav_in.readframes(n_frames)
-
-    # Convert frames to array based on sample width
-    if sample_width == 1:
-        audio_data = array.array("B", frames)  # unsigned char
-    elif sample_width == 2:
-        audio_data = array.array("h", frames)  # signed short
-    elif sample_width == 3:
-        audio_data = array.array("b", frames)  # signed byte
-    elif sample_width == 4:
-        audio_data = array.array("i", frames)  # signed int
-    else:
-        raise ValueError(f"Unsupported sample width: {sample_width}")
+        if audio.startswith("http"):
+            audio = urlopen(audio).read()
+        else:
+            with open(audio, "rb") as f:
+                audio = f.read()
+    
+    # Try loading with soundfile first (works for WAV, FLAC, OGG)
+    try:
+        waveform, sample_rate = sf.read(io.BytesIO(audio), dtype='float32')
+    except:
+        # If soundfile fails (e.g., MP3), use ffmpeg to convert to WAV
+        with tempfile.NamedTemporaryFile(suffix='.input', delete=False) as tmp_in:
+            tmp_in.write(audio)
+            tmp_in_path = tmp_in.name
         
-    # Downmix to mono if needed
-    if n_channels > 1:
-        mono_data = array.array(audio_data.typecode)
-        for i in range(0, len(audio_data), n_channels):
-            chunk = audio_data[i : i + n_channels]
-            mono_data.append(sum(chunk) // n_channels)
-        audio_data = mono_data
-
-    # Resample to 16kHz if needed
-    if frame_rate != target_sample_rate:
-        ratio = target_sample_rate / frame_rate
-        new_length = int(len(audio_data) * ratio)
-        resampled_data = array.array(audio_data.typecode)
-
-        for i in range(new_length):
-            # Linear interpolation
-            pos = i / ratio
-            pos_int = int(pos)
-            pos_frac = pos - pos_int
-
-            if pos_int >= len(audio_data) - 1:
-                sample = audio_data[-1]
-            else:
-                sample1 = audio_data[pos_int]
-                sample2 = audio_data[pos_int + 1]
-                sample = int(sample1 + (sample2 - sample1) * pos_frac)
-
-            resampled_data.append(sample)
-
-        audio_data = resampled_data
-
-    return audio_data.tobytes()
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
+        
+        try:
+            # Use ffmpeg to convert to WAV
+            subprocess.run(
+                [
+                    'ffmpeg', '-i', tmp_in_path,
+                    '-ar', str(target_sample_rate),  # Set sample rate
+                    '-ac', '1',  # Mono
+                    '-f', 'wav',  # Output format
+                    '-y',  # Overwrite
+                    tmp_out_path
+                ],
+                capture_output=True,
+                check=True
+            )
+            
+            # Load the converted WAV
+            waveform, sample_rate = sf.read(tmp_out_path, dtype='float32')
+        except subprocess.CalledProcessError as e:
+            raise ValueError(f"Failed to load audio with ffmpeg: {e.stderr.decode()}")
+        finally:
+            os.unlink(tmp_in_path)
+            if os.path.exists(tmp_out_path):
+                os.unlink(tmp_out_path)
+    
+    # Convert to mono if needed (average all channels)
+    if waveform.ndim > 1:
+        waveform = np.mean(waveform, axis=1)
+    
+    # Resample if needed (only if ffmpeg didn't already do it)
+    if sample_rate != target_sample_rate:
+        import resampy
+        waveform = resampy.resample(waveform, sample_rate, target_sample_rate)
+    
+    # Ensure waveform is 1D
+    waveform = waveform.flatten()
+    
+    # Return tensor if requested
+    if return_tensor:
+        # Force shape to be exactly (1, num_samples)
+        tensor = torch.from_numpy(waveform).reshape(1, -1)
+        print(tensor.shape)
+        return tensor
+    
+    # Convert to 16-bit PCM bytes
+    # soundfile returns float32 in range [-1, 1], convert to int16
+    waveform_int16 = (waveform * 32767).astype(np.int16)
+    
+    return waveform_int16.tobytes()
 
 
 def get_bytes_from_wav(location: str) -> bytes:
