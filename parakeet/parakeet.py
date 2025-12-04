@@ -36,6 +36,7 @@ image = (
         "soundfile",
         "fastapi[standard]",
     )
+    .apt_install("curl")
     .entrypoint([])  # silence chatty logs by container on start
 )
 
@@ -130,6 +131,7 @@ class Parakeet:
                 with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
                     output = self.model.transcribe(audio_data, batch_size=batch_size, num_workers=1)
         else:
+            audio_data = preprocess_audio(audio_data)
             audio_data = bytes_to_torch(audio_data)
             with NoStdStreams():
                 with torch.autocast("cuda", enabled=True, dtype=torch.bfloat16), torch.inference_mode(), torch.no_grad():
@@ -156,8 +158,9 @@ class Parakeet:
 @app.function(image=image)
 async def transcribe_with_api():
     from .asr_utils import preprocess_audio, batch_seq
-    import aiohttp
+    import subprocess
     import time
+    import json
 
     url = Parakeet().webapp.get_web_url() + "/api"
 
@@ -170,29 +173,39 @@ async def transcribe_with_api():
     audio_chunks = batch_seq(audio_bytes, chunk_size)
 
     latencies = []
-    async with aiohttp.ClientSession() as session:
-        for i, chunk in enumerate(audio_chunks):
-            start_time = time.perf_counter()
-            try:
-                async with session.post(
-                    url,
-                    data=chunk,
-                    headers={"Content-Type": "application/octet-stream"}
-                ) as response:
-                    if response.status != 200:
-                        print(f"Bad response: {response.status}")
-                        resp_text = await response.text()
-                        print(resp_text)
-                        continue
-                    resp_json = await response.json()
-                    transcript = resp_json.get("transcript", "")
-                    end_time = time.perf_counter()
-                    print(transcript)
-                    if i != 0:
-                        latencies.append(end_time - start_time)
-            except aiohttp.ClientError as e:
-                print(f"HTTP Error: {e}")
-                continue
+    for i, chunk in enumerate(audio_chunks):
+        # write chunk to a wave file
+        filename = write_wav_file((i, chunk))
+        
+        start_time = time.perf_counter()
+        try:
+            result = subprocess.run(
+                [
+                    "curl",
+                    "-X", "POST",
+                    "-H", "Content-Type: audio/wav",
+                    "--data-binary", f"@{filename}",
+                    url
+                ],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            resp_json = json.loads(result.stdout)
+            transcript = resp_json.get("transcript", "")
+            end_time = time.perf_counter()
+            print(transcript)
+            if i != 0:
+                latencies.append(end_time - start_time)
+        except subprocess.CalledProcessError as e:
+            print(f"Curl Error: {e.returncode}")
+            print(f"stderr: {e.stderr}")
+            continue
+        except json.JSONDecodeError as e:
+            print(f"JSON Error: {e}")
+            print(f"stdout: {result.stdout}")
+            continue
 
     if latencies:
         print(f"Average latency: {sum(latencies) / len(latencies)} seconds")
