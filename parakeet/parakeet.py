@@ -172,8 +172,6 @@ class Parakeet:
             return results
         else:
             result = output[0]
-            # print all fields of the result
-            print(result.__dict__.keys())
             if timestamp_level is not None:
                 timestamps_data = result.timestamp.get(timestamp_level, [])
                 formatted_timestamps = [
