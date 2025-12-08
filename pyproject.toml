@@ -3,7 +3,9 @@ name = "parakeet-patterns"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "modal>=1.2.2",
+    "nemo-toolkit[asr]>=2.5.3",
+    "torch>=2.9.1",
 ]
