@@ -37,7 +37,6 @@ image = (
         "resampy",
         "fastapi[standard]",
     )
-    .apt_install("curl")
     .entrypoint([])  # silence chatty logs by container on start
 )
 
@@ -51,6 +50,8 @@ NUM_WARMUP_BATCHES = 4
 
 with image.imports():
     import nemo.collections.asr as nemo_asr
+    from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceConfig
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
     import torch
     from fastapi import FastAPI, Request
     from .asr_utils import (
@@ -67,6 +68,7 @@ with image.imports():
     gpu="L40S", 
     image=image,
     min_containers=1,
+    region="us-east",
 )
 class Parakeet:
 
@@ -83,9 +85,21 @@ class Parakeet:
         self.model.to(torch.bfloat16)
         self.model.eval()
         # Configure decoding strategy
-        if self.model.cfg.decoding.strategy != "beam":
-            self.model.cfg.decoding.strategy = "greedy_batch"
-            self.model.change_decoding_strategy(self.model.cfg.decoding)
+        print(self.model.cfg.decoding)
+        print(type(self.model.cfg.decoding))
+        decoding_cfg = RNNTDecodingConfig(
+            strategy="greedy_batch",
+            durations=self.model.cfg.decoding.durations,
+            model_type=self.model.cfg.decoding.model_type,
+            greedy=self.model.cfg.decoding.greedy,
+            beam=self.model.cfg.decoding.beam,
+            preserve_alignments=True,
+            confidence_cfg = ConfidenceConfig(preserve_word_confidence=True)
+        )
+        self.model.change_decoding_strategy(decoding_cfg)
+        print(self.model.cfg.decoding)
+        print(type(self.model.cfg.decoding))
+        print(self.model.cfg.decoding.confidence_cfg)
 
         await self.warm_up_gpu()
 
@@ -111,13 +125,15 @@ class Parakeet:
 
         # batch the chunks and perform transcription
         for batch in batch_seq(audio_chunks, BATCH_SIZE):
-            print(await self.transcribe.local(batch))
+            result = await self.transcribe.local(batch, timestamp_level='word', return_word_confidence=True)
+            print(result[0])
 
     @modal.method()
     async def transcribe(
         self, 
         audio_data: Union[bytes, bytearray, list[Union[bytes, bytearray]]],
-        timestamp_level: Optional[Literal['word', 'segment', 'char']] = None
+        timestamp_level: Optional[Literal['word', 'segment', 'char']] = None,
+        return_word_confidence: bool = True,
     ) -> Union[dict, list[dict]]:
 
         is_batch = isinstance(audio_data, list)
@@ -140,7 +156,8 @@ class Parakeet:
                         audio_data, 
                         batch_size=batch_size, 
                         num_workers=1,
-                        timestamps=timestamp_level is not None
+                        timestamps=timestamp_level is not None,
+                        return_hypotheses=True,
                     )
         else:
             audio_data = preprocess_audio(audio_data, return_tensor=True)
@@ -151,39 +168,52 @@ class Parakeet:
                         timestamps=timestamp_level is not None,
                         return_hypotheses=True,
                     )
+        
+        # print(output)
 
-        # Format output - always return dict with transcript and timestamps
+        # Format output - always return dict with transcript and word level info
         if is_batch:
             results = []
             for result in output:
                 if timestamp_level is not None:
                     timestamps_data = result.timestamp.get(timestamp_level, [])
-                    formatted_timestamps = [
+                    word_level_info = [
                         (stamp.get(timestamp_level, stamp.get('segment', '')), stamp['start'], stamp['end'])
                         for stamp in timestamps_data
                     ]
+                    if timestamp_level == 'word' and return_word_confidence:
+                        word_level_info = [
+                            data + (result.word_confidence[i].item(),)
+                            for i, data in enumerate(word_level_info)
+                    ]
+
                 else:
-                    formatted_timestamps = []
+                    word_level_info = []
                 
                 results.append({
                     "transcript": result.text,
-                    "timestamps": formatted_timestamps
+                    "word_level_info": word_level_info
                 })
             return results
         else:
             result = output[0]
             if timestamp_level is not None:
                 timestamps_data = result.timestamp.get(timestamp_level, [])
-                formatted_timestamps = [
+                word_level_info = [
                     (stamp.get(timestamp_level, stamp.get('segment', '')), stamp['start'], stamp['end'])
                     for stamp in timestamps_data
                 ]
+                if timestamp_level == 'word' and return_word_confidence:
+                        word_level_info = [
+                            data + (result.word_confidence[i].item(),)
+                            for i, data in enumerate(word_level_info)
+                    ]
             else:
-                formatted_timestamps = []
+                word_level_info = []
             
             return {
                 "transcript": result.text,
-                "timestamps": formatted_timestamps
+                "word_level_info": word_level_info
             }
         
 
@@ -205,12 +235,20 @@ class Parakeet:
 
         return web_app
 
-@app.function(image=image)
-async def transcribe_with_api():
-    from .asr_utils import preprocess_audio, batch_seq
+api_test_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install("nemo_toolkit[asr]==2.3.0", "numpy<2")
+    .apt_install("curl")
+)
+    
+with api_test_image.imports():
+    from .asr_utils import preprocess_audio, batch_seq, write_wav_file
     import subprocess
     import time
     import json
+
+@app.function(image=api_test_image, enable_memory_snapshot=True, region="us-east")
+async def transcribe_with_api():
 
     url = Parakeet().webapp.get_web_url() + "/api?timestamp_level=word"
 
@@ -244,15 +282,15 @@ async def transcribe_with_api():
             
             resp_json = json.loads(result.stdout)
             transcript = resp_json.get("transcript", "")
-            timestamps = resp_json.get("timestamps", [])
+            word_level_info = resp_json.get("word_level_info", [])
             end_time = time.perf_counter()
             
             print(f"\n--- Chunk {i} ---")
             print(f"Transcript: {transcript}")
-            if timestamps:
-                print("Word-level timestamps:")
-                for word, start, end in timestamps:
-                    print(f"  {start:.2f}s - {end:.2f}s : '{word}'")
+            if word_level_info:
+                print("Word-level info:")
+                for word, start, end, confidence in word_level_info:
+                    print(f"  {start:.2f}s - {end:.2f}s : '{word}', confidence: {confidence}")
             
             if i != 0:
                 latencies.append(end_time - start_time)
