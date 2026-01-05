@@ -97,7 +97,7 @@ class DecodingConfig:
 @dataclass
 class ASRConfig:
     """ASR model configuration"""
-    model_name: str = "stt_en_fastconformer_hybrid_large_streaming_multi"
+    model_name: str = "nvidia/nemotron-speech-streaming-en-0.6b"
     device: str = "cuda"
     device_id: int = 0
     compute_dtype: str = "bfloat16"
@@ -221,7 +221,7 @@ class CacheAwarePipelineConfig:
     image=image,
     secrets=[hf_secret] if hf_secret is not None else [],
     timeout=3600,
-    min_containers=1,
+    # min_containers=1,
     scaledown_window=3600,
     region="us-east",
 )
@@ -257,9 +257,6 @@ class NemotronASR:
         
         # Create config as dataclass, then convert to OmegaConf
         config = CacheAwarePipelineConfig()
-        
-        # Override model path to use local .nemo file
-        config.asr.model_name = "/model/Parakeet_Reatime_En_600M.nemo"
         
         # Disable ITN and NMT
         # ITN was causing 2+ second blocking in inference loop without being used
