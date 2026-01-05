@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from abc import abstractmethod
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Any
 import time
+import math
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf
+from torch import Tensor
 
-from omegaconf import DictConfig
 
 from nemo.collections.asr.inference.model_wrappers.asr_inference_wrapper import ASRInferenceWrapper
 from nemo.collections.asr.inference.pipelines.pipeline_interface import PipelineInterface
@@ -27,85 +29,31 @@ from nemo.collections.asr.inference.utils.pipeline_utils import (
     check_existance_of_required_attributes,
     get_leading_punctuation_regex_pattern,
     ids_to_text_without_stripping,
+    get_confidence_utils,
 )
 from nemo.collections.asr.inference.utils.progressbar import ProgressBar
-from nemo.collections.asr.inference.utils.text_segment import TextSegment
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
+from nemo.collections.asr.inference.pipelines.base_pipeline import TranscribeStepOutput
+from nemo.collections.asr.inference.model_wrappers.cache_aware_rnnt_inference_wrapper import CacheAwareRNNTInferenceWrapper
+from nemo.collections.asr.inference.streaming.decoders.greedy.greedy_rnnt_decoder import RNNTGreedyDecoder
+from nemo.collections.asr.inference.streaming.endpointing.greedy.greedy_rnnt_endpointing import RNNTGreedyEndpointing
+from nemo.collections.asr.inference.streaming.state.cache_aware_rnnt_state import CacheAwareRNNTStreamingState
+from nemo.collections.asr.inference.utils.endpointing_utils import millisecond_to_frames
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.inference.factory.buffered_pipeline_builder import BufferedPipelineBuilder
+from nemo.collections.asr.inference.utils.enums import PipelineType
+from nemo.collections.asr.inference.factory.base_builder import BaseBuilder
+from nemo.collections.asr.inference.pipelines.cache_aware_ctc_pipeline import CacheAwareCTCPipeline
+from nemo.collections.asr.inference.utils.enums import ASRDecodingType
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
+from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
+from nemo.utils import logging
 
 if TYPE_CHECKING:
     from nemo.collections.asr.inference.itn.inverse_normalizer import AlignmentPreservingInverseNormalizer
     from nemo.collections.asr.inference.nmt.llm_translator import LLMTranslator
 
-
-@dataclass
-class TranscribeStepOutput:
-    """
-    Stores the output of a single transcribe step.
-    """
-
-    stream_id: int
-    # Final transcript is the transcript generated started from the previous EoU to the current EoU
-    # It is finalized transcript, optionally punctuated and ITN-normalized. It's not subject to further modifications.
-    # Final segments contains metadata for each word/segment in the final transcript.
-    final_transcript: str = ""
-    final_segments: list[TextSegment] | None = None
-    final_translation: str = ""
-    # Partial transcript is the transcript generated started from the previous EoU up to the current frame
-    # It is not finalized transcript, it may be subject to further modifications.
-    # It can also contain transcript from future frames.
-    partial_transcript: str = ""
-    partial_translation: str = ""
-    # Current step transcript/translation is the transcript/translation generated from the current frame
-    current_step_transcript: str = ""
-    current_step_translation: str = ""
-
-    @classmethod
-    def from_state(cls, state: StreamingState, request: Request, sep: str = ' ') -> 'TranscribeStepOutput':
-        """
-        Create a TranscribeStepOutput from a StreamingState
-        Args:
-            state (StreamingState): The state to create the output from.
-            request (Request): The request to create the output from.
-            sep (str): The separator for the text postprocessor.
-        Returns:
-            TranscribeStepOutput: The output for the step.
-        """
-        final_transcript = state.final_transcript.strip()
-        final_segments = [seg.copy() for seg in state.final_segments]
-        if len(final_segments) > 0:
-            final_segments[0].text = final_segments[0].text.lstrip(sep)
-            final_segments[-1].text = final_segments[-1].text.rstrip(sep)
-
-        if final_transcript:
-            separator = ''
-            if not request.is_first and state.concat_with_space:
-                separator = sep
-            final_transcript = separator + final_transcript
-            if len(final_segments) > 0:
-                final_segments[0].text = separator + final_segments[0].text
-        return cls(
-            stream_id=request.stream_id,
-            final_transcript=final_transcript,
-            final_segments=final_segments,
-            partial_transcript=state.partial_transcript,
-            current_step_transcript=state.current_step_transcript,
-        )
-
-    def __str__(self) -> str:
-        """
-        Return a string representation of the TranscribeStepOutput
-        """
-        info = {
-            "final_transcript": self.final_transcript,
-            "final_translation": self.final_translation,
-            "partial_transcript": self.partial_transcript,
-            "partial_translation": self.partial_translation,
-            "current_step_transcript": self.current_step_transcript,
-        }
-        return json.dumps(info, indent=4, ensure_ascii=False)
-
-
-class BasePipeline(PipelineInterface):
+class BaseStreamingPipeline(PipelineInterface):
     """
     Base class for all pipelines.
     """
@@ -241,11 +189,6 @@ class BasePipeline(PipelineInterface):
     @abstractmethod
     def transcribe_step_for_feature_buffers(self, fbuffers: list[FeatureBuffer]) -> None:
         """Transcribe a step for feature buffers"""
-        pass
-
-    @abstractmethod
-    def get_request_generator(self) -> ContinuousBatchedRequestStreamer:
-        """Return the request generator."""
         pass
 
     @abstractmethod
@@ -550,127 +493,8 @@ class BasePipeline(PipelineInterface):
             cache_aware_model=self.asr_model, num_slots=self.num_slots, use_cache=self.use_cache
         )
 
-    def run(
-        self,
-        audio_filepaths: list[str],
-        options: list[ASRRequestOptions] | None = None,
-        progress_bar: ProgressBar | None = None,
-    ) -> dict:
-        """
-        Orchestrates reading from audio_filepaths in a streaming manner,
-        transcribes them, and packs the results into a PipelineOutput.
-        Args:
-            audio_filepaths (list[str]): List of audio filepaths to transcribe.
-            options (list[ASRRequestOptions] | None): List of RequestOptions for each stream.
-            progress_bar (ProgressBar | None): Progress bar to show the progress. Default is None.
-        Returns:
-            dict: A dictionary containing transcriptions and segments for each stream.
-        """
-        if progress_bar is not None and not isinstance(progress_bar, ProgressBar):
-            raise ValueError("progress_bar must be an instance of ProgressBar.")
 
-        if options is None:
-            # Use default options if not provided
-            options = [ASRRequestOptions() for _ in audio_filepaths]
-
-        if len(options) != len(audio_filepaths):
-            raise ValueError("options must be the same length as audio_filepaths")
-
-        request_generator = self.get_request_generator()
-        request_generator.set_audio_filepaths(audio_filepaths, options)
-        request_generator.set_progress_bar(progress_bar)
-
-        pipeline_output = {}
-        sep = self.get_sep()
-        self.open_session()
-        for requests in request_generator:
-            step_outputs = self.transcribe_step(requests)
-            for step_output in step_outputs:
-                stream_id = step_output.stream_id
-                if stream_id not in pipeline_output:
-                    pipeline_output[stream_id] = {
-                        "text": "",
-                        "translation": "",
-                        "segments": [],
-                        "audio_filepath": request_generator.get_audio_filepath(stream_id),
-                        "translation_segments": [],
-                    }
-
-                accumulated_text = pipeline_output[stream_id]["text"]
-                accumulated_translation = pipeline_output[stream_id]["translation"]
-                final_transcript = step_output.final_transcript
-                final_translation = step_output.final_translation
-                final_segments = step_output.final_segments
-                if not accumulated_text:
-                    final_transcript = final_transcript.lstrip(sep)
-                    if len(final_segments) > 0:
-                        first_segment = final_segments[0]
-                        first_segment.text = first_segment.text.lstrip(sep)
-
-                if not accumulated_translation:
-                    final_translation = final_translation.lstrip(sep)
-
-                accumulated_text += final_transcript
-                accumulated_translation += final_translation
-                pipeline_output[stream_id]["text"] = accumulated_text
-                pipeline_output[stream_id]["translation"] = accumulated_translation
-                pipeline_output[stream_id]["segments"].extend(final_segments)
-
-                if self.nmt_enabled:
-                    step_translation = step_output.current_step_translation
-                    delay = request_generator.get_elapsed_duration(stream_id)
-                    pipeline_output[stream_id]["translation_segments"].append((step_translation, delay))
-
-        self.close_session()
-        return pipeline_output
-
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
-
-import math
-from typing import TYPE_CHECKING
-
-import numpy as np
-import torch
-from omegaconf import DictConfig
-from torch import Tensor
-
-from nemo.collections.asr.inference.model_wrappers.cache_aware_rnnt_inference_wrapper import (
-    CacheAwareRNNTInferenceWrapper,
-)
-from nemo.collections.asr.inference.streaming.decoders.greedy.greedy_rnnt_decoder import RNNTGreedyDecoder
-from nemo.collections.asr.inference.streaming.endpointing.greedy.greedy_rnnt_endpointing import RNNTGreedyEndpointing
-from nemo.collections.asr.inference.streaming.framing.multi_stream import ContinuousBatchedRequestStreamer
-from nemo.collections.asr.inference.streaming.framing.request import FeatureBuffer, Frame
-from nemo.collections.asr.inference.streaming.framing.request_options import ASRRequestOptions
-from nemo.collections.asr.inference.streaming.state.cache_aware_rnnt_state import CacheAwareRNNTStreamingState
-from nemo.collections.asr.inference.utils.endpointing_utils import millisecond_to_frames
-from nemo.collections.asr.inference.utils.enums import RequestType
-from nemo.collections.asr.inference.utils.pipeline_utils import (
-    check_existance_of_required_attributes,
-    get_confidence_utils,
-)
-from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-
-if TYPE_CHECKING:
-    from nemo.collections.asr.inference.itn.inverse_normalizer import AlignmentPreservingInverseNormalizer
-    from nemo.collections.asr.inference.nmt.llm_translator import LLMTranslator
-
-
-class CacheAwareRNNTPipeline(BasePipeline):
+class CacheAwareRNNTStreamingPipeline(BaseStreamingPipeline):
     """Cache Aware RNNT pipeline."""
 
     def __init__(
@@ -681,7 +505,7 @@ class CacheAwareRNNTPipeline(BasePipeline):
         nmt_model: LLMTranslator | None = None,
     ):
         """
-        Initialize the CacheAwareRNNTPipeline.
+        Initialize the CacheAwareRNNTStreamingPipeline.
         Args:
             cfg: (DictConfig) Configuration parameters.
             asr_model: (CacheAwareRNNTInferenceWrapper) ASR model.
@@ -996,25 +820,6 @@ class CacheAwareRNNTPipeline(BasePipeline):
 
         self.update_partial_transcript(frames, self.tokenizer, self.leading_regex_pattern)
 
-    def get_request_generator(self) -> ContinuousBatchedRequestStreamer:
-        """
-        Initialize the request generator.
-        Returns:
-            (ContinuousBatchedRequestStreamer) Request generator.
-        """
-        # for cache aware streaming we need to process one frame at a time -> n_frames_per_stream=1
-        request_generator = ContinuousBatchedRequestStreamer(
-            n_frames_per_stream=1,
-            frame_size_in_secs=self.chunk_size_in_secs,
-            sample_rate=self.sample_rate,
-            batch_size=self.batch_size,
-            request_type=self.request_type,
-            preprocessor=None,
-            buffer_size_in_secs=None,
-            device=None,
-            pad_last_frame=True,
-        )
-        return request_generator
 
     def init_streaming_request_generator(self):
         """
@@ -1035,51 +840,28 @@ class CacheAwareRNNTPipeline(BasePipeline):
             pad_last_frame=True,
         )
 
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-from omegaconf import DictConfig, OmegaConf
-
-from nemo.collections.asr.inference.factory.base_builder import BaseBuilder
-from nemo.collections.asr.inference.pipelines.cache_aware_ctc_pipeline import CacheAwareCTCPipeline
-from nemo.collections.asr.inference.utils.enums import ASRDecodingType
-from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecodingConfig
-from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecodingConfig
-from nemo.utils import logging
-
-
-class CacheAwarePipelineBuilder(BaseBuilder):
+class CacheAwareStreamingPipelineBuilder(BaseBuilder):
     """
-    Cache Aware Pipeline Builder class.
+    Cache Aware Streaming Pipeline Builder class.
     Builds the cache aware CTC/RNNT pipelines.
     """
 
     @classmethod
-    def build(cls, cfg: DictConfig) -> CacheAwareCTCPipeline | CacheAwareRNNTPipeline:
+    def build(cls, cfg: DictConfig) -> CacheAwareCTCPipeline | CacheAwareRNNTStreamingPipeline:
         """
         Build the cache aware streaming pipeline based on the config.
         Args:
             cfg: (DictConfig) Config
         Returns:
-            Returns CacheAwareCTCPipeline or CacheAwareRNNTPipeline object
+            Returns CacheAwareCTCStreamingPipeline [Not implemented] or CacheAwareRNNTStreamingPipeline object
         """
         asr_decoding_type = ASRDecodingType.from_str(cfg.asr_decoding_type)
 
         if asr_decoding_type is ASRDecodingType.RNNT:
             return cls.build_cache_aware_rnnt_pipeline(cfg)
         elif asr_decoding_type is ASRDecodingType.CTC:
-            return cls.build_cache_aware_ctc_pipeline(cfg)
+            raise ValueError("Cache aware CTC pipeline is not implemented for streaming.")
 
         raise ValueError("Invalid asr decoding type for cache aware streaming. Need to be one of ['CTC', 'RNNT']")
 
@@ -1108,13 +890,13 @@ class CacheAwarePipelineBuilder(BaseBuilder):
         return decoding_cfg
 
     @classmethod
-    def build_cache_aware_rnnt_pipeline(cls, cfg: DictConfig) -> CacheAwareRNNTPipeline:
+    def build_cache_aware_rnnt_pipeline(cls, cfg: DictConfig) -> CacheAwareRNNTStreamingPipeline:
         """
         Build the cache aware RNNT streaming pipeline based on the config.
         Args:
             cfg: (DictConfig) Config
         Returns:
-            Returns CacheAwareRNNTPipeline object
+            Returns CacheAwareRNNTStreamingPipeline object
         """
         # building ASR model
         decoding_cfg = cls.get_rnnt_decoding_cfg(cfg)
@@ -1127,7 +909,7 @@ class CacheAwarePipelineBuilder(BaseBuilder):
         nmt_model = cls._build_nmt(cfg)
 
         # building cache aware RNNT pipeline
-        ca_rnnt_pipeline = CacheAwareRNNTPipeline(cfg, asr_model, itn_model, nmt_model)
+        ca_rnnt_pipeline = CacheAwareRNNTStreamingPipeline(cfg, asr_model, itn_model, nmt_model)
         logging.info(f"`{type(ca_rnnt_pipeline).__name__}` pipeline loaded")
         return ca_rnnt_pipeline
 
@@ -1155,33 +937,9 @@ class CacheAwarePipelineBuilder(BaseBuilder):
         logging.info(f"`{type(ca_ctc_pipeline).__name__}` pipeline loaded")
         return ca_ctc_pipeline
 
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-
-from typing import Any
-
-import torch
-from omegaconf.dictconfig import DictConfig
-
-from nemo.collections.asr.inference.factory.buffered_pipeline_builder import BufferedPipelineBuilder
-from nemo.collections.asr.inference.utils.enums import PipelineType
-from nemo.utils import logging
-
-
-class PipelineBuilder:
-    """Router for building the pipeline based on the pipeline type."""
+class StreamingPipelineBuilder:
+    """Router for building the streaming pipeline based on the pipeline type."""
 
     @staticmethod
     def set_matmul_precision(matmul_precision: str) -> None:
@@ -1218,14 +976,15 @@ class PipelineBuilder:
         Returns:
             Returns Pipeline object
         """
-        PipelineBuilder.set_log_level(cfg.log_level)
-        PipelineBuilder.set_matmul_precision(cfg.matmul_precision)
+        StreamingPipelineBuilder.set_log_level(cfg.log_level)
+        StreamingPipelineBuilder.set_matmul_precision(cfg.matmul_precision)
         pipeline_type = PipelineType.from_str(cfg.pipeline_type)
         if pipeline_type is PipelineType.BUFFERED:
-            builder = BufferedPipelineBuilder
+            # builder = BufferedPipelineBuilder
+            raise ValueError("Buffered pipeline is not implemented for streaming.")
         elif pipeline_type is PipelineType.CACHE_AWARE:
-            builder = CacheAwarePipelineBuilder
+            builder = CacheAwareStreamingPipelineBuilder
         else:
-            raise ValueError(f"Invalid pipeline type: {cfg.pipeline_type}")
+            raise ValueError(f"Invalid streaming pipeline type: {cfg.pipeline_type}")
 
         return builder.build(cfg)

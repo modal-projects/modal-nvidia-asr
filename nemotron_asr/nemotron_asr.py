@@ -67,7 +67,7 @@ with image.imports():
     
     # Import local utilities
     from .asr_utils import preprocess_audio
-    from .pipelines import PipelineBuilder
+    from .pipelines import StreamingPipelineBuilder
 
 
 # ## Configuration Dataclass
@@ -295,7 +295,7 @@ class NemotronASR:
         print(f"  Batch size: {self.cfg.streaming.batch_size}")
         
         # Build the pipeline using PipelineBuilder
-        self.pipeline = PipelineBuilder.build_pipeline(self.cfg)
+        self.pipeline = StreamingPipelineBuilder.build_pipeline(self.cfg)
         
         print("Pipeline loaded successfully!")
         
