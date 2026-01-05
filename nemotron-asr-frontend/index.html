@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cache-Aware RNNT Streaming STT</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 800px;
+            width: 100%;
+            height: 100%;
+            max-height: calc(100vh - 40px);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            flex-shrink: 0;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
+        .info-box {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            font-size: 14px;
+            color: #1976d2;
+            flex-shrink: 0;
+        }
+        #status {
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-weight: 500;
+            flex-shrink: 0;
+        }
+        #status.idle {
+            background: #e8f4f8;
+            color: #2196F3;
+            border: 2px solid #bbdefb;
+        }
+        #status.connecting {
+            background: #fff3e0;
+            color: #f57c00;
+            border: 2px solid #ffe0b2;
+        }
+        #status.connected {
+            background: #efe;
+            color: #3c3;
+            border: 2px solid #cfc;
+        }
+        #status.recording {
+            background: #fef3cd;
+            color: #856404;
+            border: 2px solid #ffeaa7;
+        }
+        #status.error {
+            background: #fee;
+            color: #c33;
+            border: 2px solid #fcc;
+        }
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            font-size: 16px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%;
+            margin-bottom: 20px;
+            flex-shrink: 0;
+        }
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        button.recording {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        #transcript-container {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+            flex: 1 1 auto;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            min-height: 0; /* Important for flexbox overflow */
+            scroll-behavior: smooth;
+        }
+        #transcript-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        #transcript-container::-webkit-scrollbar-track {
+            background: #e0e0e0;
+            border-radius: 10px;
+        }
+        #transcript-container::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        #transcript-container::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+        #transcript {
+            color: #333;
+            line-height: 1.8;
+            font-size: 16px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            flex: 0 0 auto; /* Don't grow, let parent scroll */
+        }
+        .partial {
+            color: #999;
+            font-style: italic;
+            background: rgba(153, 153, 153, 0.05);
+            padding: 0 4px;
+            border-radius: 3px;
+        }
+        .final {
+            color: #333;
+            font-weight: 500;
+        }
+        .final:not(:empty)::after {
+            content: ' ';
+            display: inline;
+        }
+        .metadata {
+            font-size: 12px;
+            color: #666;
+            padding: 15px;
+            background: white;
+            border-radius: 10px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .metadata-item {
+            display: flex;
+            flex-direction: column;
+        }
+        .metadata-label {
+            font-weight: 600;
+            color: #764ba2;
+            margin-bottom: 5px;
+        }
+        .metadata-value {
+            color: #333;
+        }
+        
+        /* Responsive adjustments */
+        @media (max-width: 600px) {
+            body {
+                padding: 10px;
+            }
+            .container {
+                padding: 20px;
+                max-height: calc(100vh - 20px);
+            }
+            .metadata {
+                grid-template-columns: repeat(2, 1fr);
+                font-size: 11px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Nemotron ASR</h1>
+        
+        <button id="recordBtn" disabled>Connecting...</button>
+        
+        <div id="transcript-container">
+            <div id="transcript">Transcription will appear here...</div>
+        </div>
+
+        <div class="metadata">
+            <div class="metadata-item">
+                <span class="metadata-label">Audio Timestamp</span>
+                <span class="metadata-value" id="audio-timestamp">0.00s</span>
+            </div>
+            <!-- <div class="metadata-item">
+                <span class="metadata-label">Inference Time</span>
+                <span class="metadata-value" id="inference-time">0ms</span>
+            </div> -->
+            <div class="metadata-item">
+                <span class="metadata-label">Step</span>
+                <span class="metadata-value" id="step">0</span>
+            </div>
+            <!-- <div class="metadata-item">
+                <span class="metadata-label">Status</span>
+                <span class="metadata-value" id="is-final">-</span>
+            </div> -->
+        </div>
+    </div>
+
+    <!-- No external dependencies needed - using raw bytes + JSON protocol -->
+    <script src="/static/cache-aware-stt.js"></script>
+    <!-- Note: audio-processor.js is loaded as an AudioWorklet module via audioContext.audioWorklet.addModule() -->
+</body>
+</html>
