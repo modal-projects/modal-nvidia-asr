@@ -16,11 +16,11 @@ modal setup
 
 # Nemotron-Speech ASR
 
-Nemotron-Speech ASR is a powerful open weights model that can stream high numbers of concurrent clients.
+[Nemotron-Speech ASR](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) is a powerful open weights model that can stream high numbers of concurrent clients.
 It outputs partial and final transcripts, capitlization and punctiontuation, and has word boosting capabilities for domain-specific vocabulary.
 
-However, `NeMO` does not currently provide an implementation for asynchronous, concurrent clients. This codebase includes extensions to 
-`NeMO` that enables batched, cache-aware inference on asynchronous streaming clients.
+`NeMO` does not currently provide an implementation for asynchronous, concurrent clients. This codebase includes extensions to 
+`NeMO` that enable batched, cache-aware inference on asynchronous streaming clients. It is based on `NeMO`'s [inference `Pipeline`](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). 
 
 ## Deployment
 
