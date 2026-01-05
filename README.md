@@ -1,6 +1,34 @@
-# Batch and Streaming Parakeet
+# NVIDIA ASR Implementations on Modal
 
-This repository demonstrates four approaches to deploy NVIDIA's Parakeet ASR models on Modal for **batch** and **streaming** transcription.
+This repository demonstrates approaches to deploy NVIDIA's Nemotron-Speech ASR and Parakeet ASR models on Modal for **batch** and **streaming** transcription.
+
+## Install and setup Modal
+
+```bash
+pip install modal
+```
+
+Authenticate your Modal account:
+
+```bash
+modal setup
+```
+
+# Nemotron-Speech ASR
+
+Nemotron-Speech ASR is a powerful open weights model that can stream high numbers of concurrent clients.
+It outputs partial and final transcripts, capitlization and punctiontuation, and has word boosting capabilities for domain-specific vocabulary.
+
+However, `NeMO` does not currently provide an implementation for asynchronous, concurrent clients. This codebase includes extensions to 
+`NeMO` that enables batched, cache-aware inference on asynchronous streaming clients.
+
+## Deployment
+
+```bash
+modal deploy -m nemotron_asr.nemotron_asr
+```
+
+# Batch and Streaming Parakeet
 
 ## Implementation
 
@@ -63,21 +91,7 @@ Key features:
 
 This approach is ideal for scenarios with multiple speakers (meetings, conversations, interviews) where you need to know "who said what" in real-time.
 
-## Getting Started
-
-Install dependencies:
-
-```bash
-pip install modal
-```
-
-Authenticate your Modal account:
-
-```bash
-modal setup
-```
-
-Deploy to Modal:
+## Deploy
 
 ```bash
 # 1. Batch transcription
