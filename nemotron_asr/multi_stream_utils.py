@@ -40,10 +40,7 @@ class StreamingMonoStream(Stream):
         self.pad_last_frame = pad_last_frame
         self.max_buffer_samples = int(max_buffer_seconds * rate)
 
-        # Audio buffer optimization: keep chunks in a list and lazily concatenate
-        # This avoids O(n) torch.cat() on every append, making appends O(1)
         self.audio_chunks = []  # List of torch tensors
-        # self.audio_chunks = b"" # bytes
         self.chunk_sizes = []  # Size of each chunk for efficient chunk-level tracking
         self.total_samples = 0  # Total samples across all chunks
         self.chunk_offset = 0  # How many chunks have been fully consumed
@@ -52,10 +49,6 @@ class StreamingMonoStream(Stream):
         self.is_ended = False
         self.frame_count = 0
         self.options = None
-        # NO LOCK NEEDED: We run in single-threaded asyncio event loop
-        # - append_audio() called from async tasks (event loop serializes)
-        # - __next__() blocks event loop while running (no concurrent access possible)
-        # - threading.Lock() was causing GIL contention for no benefit!
         self.dropped_frames = 0  # Track dropped frames for monitoring
         
         super().__init__(stream_id)
@@ -80,22 +73,20 @@ class StreamingMonoStream(Stream):
         This minimizes work in recv_loop tasks and centralizes computation.
         """
         if isinstance(samples, bytes):
-            # NEW: Store raw bytes, defer conversion to inference loop (_extract_samples)
-            # This keeps recv_loop lightweight (pure I/O)
             self.audio_chunks.append(samples)
             # int16 = 2 bytes per sample
             num_samples = len(samples) // 2
             self.chunk_sizes.append(num_samples)
             self.total_samples += num_samples
-        elif isinstance(samples, torch.Tensor):
-            # Handle torch tensors (for backwards compatibility)
-            # Ensure samples are 1D
-            if samples.dim() > 1:
-                samples = samples.squeeze()
-            chunk_size = len(samples)
-            self.audio_chunks.append(samples)
-            self.chunk_sizes.append(chunk_size)
-            self.total_samples += chunk_size
+        # elif isinstance(samples, torch.Tensor):
+        #     # Handle torch tensors (for backwards compatibility)
+        #     # Ensure samples are 1D
+        #     if samples.dim() > 1:
+        #         samples = samples.squeeze()
+        #     chunk_size = len(samples)
+        #     self.audio_chunks.append(samples)
+        #     self.chunk_sizes.append(chunk_size)
+        #     self.total_samples += chunk_size
         else:
             raise ValueError(f"samples must be torch.Tensor or bytes, got {type(samples)}")
 
@@ -147,16 +138,6 @@ class StreamingMonoStream(Stream):
         """
         remaining_samples = self._get_remaining_samples()
         
-        # LAG DETECTION: If buffer is too large, drop old frames to catch up to real-time
-        # if remaining_samples > self.max_buffer_samples:
-        #     frames_to_drop = (remaining_samples - self.max_buffer_samples) // self.frame_size
-        #     if frames_to_drop > 0:
-        #         samples_to_drop = frames_to_drop * self.frame_size
-        #         self._advance_position(samples_to_drop)
-        #         self.dropped_frames += frames_to_drop
-        #         remaining_samples = self._get_remaining_samples()
-        #         print(f"⚠️  Stream {self.stream_id}: LAG DETECTED! Dropped {frames_to_drop} frames ({frames_to_drop * 0.08:.2f}s) to catch up. Total dropped: {self.dropped_frames}")
-        
         # Check if we have any data
         if len(self.audio_chunks) == 0 or self.chunk_offset >= len(self.audio_chunks):
             if self.is_ended:
@@ -173,27 +154,16 @@ class StreamingMonoStream(Stream):
             samples_to_extract = self.frame_size
             is_final = False
             
-        # Case 2: Stream ended, return remaining samples
-        # elif self.is_ended and remaining_samples > 0:
-        #     samples_to_extract = remaining_samples
-        #     is_final = True
-            
-        # Case 3: Stream ended and no data left
+        # Case 2: Stream ended and no data left
         elif self.is_ended:
             raise StopIteration
             
-        # Case 4: Not enough data yet, wait for more
+        # Case 3: Not enough data yet, wait for more
         else:
             raise NotEnoughDataException(f"Stream {self.stream_id} needs more data")
         
         # Extract the samples efficiently
         chunk_samples = self._extract_samples(samples_to_extract)
-        
-        # Pad if needed and this is the final frame
-        # if is_final and self.pad_last_frame and len(chunk_samples) < self.frame_size:
-        #     padded = torch.zeros(self.frame_size)
-        #     padded[:len(chunk_samples)] = chunk_samples
-        #     chunk_samples = padded
 
         # Package the frame
         is_first = self.frame_count == 0
@@ -236,7 +206,6 @@ class StreamingMonoStream(Stream):
         for idx in range(self.chunk_offset, len(self.audio_chunks)):
             chunk = self.audio_chunks[idx]
             if isinstance(chunk, bytes):
-                # CONVERSION HAPPENS HERE (inference loop context, not recv_loop!)
                 # Convert and cache back to avoid re-converting
                 np_audio = np.frombuffer(chunk, dtype=np.int16)
                 np_audio = np_audio.astype(np.float32) / 32768.0
@@ -255,8 +224,6 @@ class StreamingMonoStream(Stream):
             result = converted_chunks[0][self.position_in_chunk:self.position_in_chunk + num_samples]
             return result.to("cuda", non_blocking=True)
         
-        # print(f"*****************WARNING: Slow path: need to concatenate across chunks")
-        # Slow path: need to concatenate across chunks
         # Only concatenate the unconsumed portion of the first chunk
         if self.position_in_chunk > 0:
             first_chunk = converted_chunks[0][self.position_in_chunk:]
@@ -300,7 +267,6 @@ class StreamingMonoStream(Stream):
             self.audio_chunks = self.audio_chunks[self.chunk_offset:]
             self.chunk_sizes = self.chunk_sizes[self.chunk_offset:]
             self.chunk_offset = 0
-            # total_samples stays the same as it tracks all samples ever added
 
 
 class MultiStream:
