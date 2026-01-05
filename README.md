@@ -20,7 +20,7 @@ Nemotron-Speech ASR is a powerful open weights model that can stream high number
 It outputs partial and final transcripts, capitlization and punctiontuation, and has word boosting capabilities for domain-specific vocabulary.
 
 However, `NeMO` does not currently provide an implementation for asynchronous, concurrent clients. This codebase includes extensions to 
-`NeMO` that enables batched, cache-aware inference on asynchronous streaming clients.
+`NeMO` that enable batched, cache-aware inference on asynchronous streaming clients.
 
 ## Deployment
 
