@@ -4,6 +4,8 @@ This repository demonstrates approaches to deploy NVIDIA's Nemotron-Speech ASR a
 
 ## Install and setup Modal
 
+Make an account with [Modal](https://www.modal.com) if you haven't already.
+
 ```bash
 pip install modal
 ```
