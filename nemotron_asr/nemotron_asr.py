@@ -223,7 +223,6 @@ class CacheAwarePipelineConfig:
     timeout=3600,
     # min_containers=1,
     scaledown_window=3600,
-    region="us-east",
 )
 @modal.concurrent(max_inputs=512)
 class NemotronASR:
