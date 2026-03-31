@@ -1229,7 +1229,7 @@ class WebServer:
             # Get the WebSocket URL from the NemotronASR
             cls_instance = NemotronASR()
             ws_base_url = (
-                cls_instance.webapp.web_url.replace("http", "ws") + "/ws"
+                cls_instance.webapp.get_web_url().replace("http", "ws") + "/ws"
             )
             script_tag = f'<script>window.WS_BASE_URL = "{ws_base_url}";</script>'
             html_content = html_content.replace(
